@@ -6,7 +6,7 @@ __pycache__/
 data/raw/
 data/processed/
 
-models/
+/models/
 *.pkl
 *.joblib
 *.h5
