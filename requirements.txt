@@ -8,5 +8,6 @@ pyarrow==25.0.1
 joblib==1.6.0
 xgboost==3.4.1
 lightgbm==4.7.0
+torch==2.14.1
 jupyterlab==4.6.3
 ipykernel==7.3.0
