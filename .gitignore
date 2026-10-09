@@ -3,8 +3,12 @@ __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 
-data/raw/
-data/processed/
+# Ignore datasets and processed files, except DVC metadata.
+data/raw/*
+!data/raw/*.dvc
+
+data/processed/*
+!data/processed/*.dvc
 
 /models/
 *.pkl
