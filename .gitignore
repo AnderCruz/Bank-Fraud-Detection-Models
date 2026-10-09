@@ -3,11 +3,16 @@ __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 
-# Ignore datasets and processed files, except DVC metadata.
-data/raw/*
+# Ignore raw datasets while preserving DVC metadata.
+data/raw/**/*.csv
+data/raw/**/*.parquet
+data/raw/**/*.joblib
 !data/raw/*.dvc
 
-data/processed/*
+# Ignore processed data while preserving DVC metadata.
+data/processed/**/*.csv
+data/processed/**/*.parquet
+data/processed/**/*.joblib
 !data/processed/*.dvc
 
 /models/
