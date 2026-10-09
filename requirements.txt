@@ -11,3 +11,4 @@ lightgbm==4.7.0
 torch==2.14.1
 jupyterlab==4.6.3
 ipykernel==7.3.0
+mlflow==3.10.1

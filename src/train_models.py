@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import mlflow
 import numpy as np
 import pandas as pd
 import torch
@@ -222,6 +223,63 @@ def config_to_dict(config: RunConfig) -> dict[str, Any]:
     """Convert the dataclass configuration into JSON-compatible values."""
     return asdict(config)
 
+def flatten_mlflow_params(
+    value: Any,
+    prefix: str = "",
+) -> dict[str, str]:
+    """Convert nested configuration values into MLflow-compatible parameters."""
+    # Initialize the flattened parameter dictionary.
+    parameters: dict[str, str] = {}
+
+    # Recursively flatten dictionaries using dotted parameter names.
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_name = f"{prefix}.{key}" if prefix else str(key)
+            parameters.update(flatten_mlflow_params(item, key_name))
+
+    # Serialize lists as JSON to preserve their original structure.
+    elif isinstance(value, (list, tuple)):
+        parameters[prefix] = json.dumps(value)
+
+    # Convert scalar values to strings and represent missing values explicitly.
+    else:
+        parameters[prefix] = str(value)
+
+    return parameters
+
+
+def log_model_artifacts(
+    model_name: str,
+    model_dir: Path,
+    config: RunConfig,
+) -> None:
+    """Log a trained model and its metadata to the active MLflow run."""
+    # Identify the artifact format used by the selected model family.
+    if model_name in {"random_forest", "xgboost", "logistic_regression", "lightgbm"}:
+        suffix = config.output.artifact_suffixes["sklearn"]
+    else:
+        suffix = config.output.artifact_suffixes["pytorch"]
+
+    # Locate the trained model and its accompanying metadata.
+    artifact_files = (
+        model_dir / f"{model_name}{suffix}",
+        model_dir / f"{model_name}{config.output.metadata_suffix}",
+    )
+
+    # Fail explicitly rather than silently logging an incomplete model.
+    for artifact_file in artifact_files:
+        if not artifact_file.is_file():
+            raise FileNotFoundError(
+                f"Expected model artifact does not exist: {artifact_file}"
+            )
+
+        # Group each model and its metadata under a dedicated artifact path.
+        mlflow.log_artifact(
+            str(artifact_file),
+            artifact_path=f"models/{model_name}",
+        )
+
+
 
 def serialize_config(config: RunConfig) -> str:
     """Serialize configuration deterministically for future run tracking."""
@@ -247,6 +305,7 @@ def collect_provenance(config: RunConfig,
     """Collect runtime, dependency, Git, and existing run configuration details."""
     distribution_names = (
         "numpy", "pandas", "scikit-learn", "xgboost", "lightgbm", "torch",
+        "mlflow",
     )
     dependencies: dict[str, str | None] = {}
     for distribution_name in distribution_names:
@@ -525,22 +584,59 @@ def train_supervised_torch(model: nn.Module, train_loader: DataLoader,
     return best_state, best_epoch, float(best_ap)
 
 
+def make_feature_sequences(features: pd.DataFrame, length: int) -> np.ndarray:
+    """Create ordered sliding feature windows without crossing input boundaries."""
+    values = features.to_numpy(dtype=np.float32)
+    return np.stack([
+        values[i:i + length]
+        for i in range(len(values) - length + 1)
+    ])
+
+
 def make_sequences(features: pd.DataFrame, labels: pd.Series,
                    length: int) -> tuple[np.ndarray, np.ndarray]:
-    """Create sliding windows within one split; target the final transaction."""
-    values = features.to_numpy(dtype=np.float32)
+    """Create split-local windows and target the final transaction in each."""
     targets = labels.to_numpy(dtype=np.int64)
-    windows = np.stack([values[i:i + length]
-                        for i in range(len(values) - length + 1)])
+    windows = make_feature_sequences(features, length)
     return windows, targets[length - 1:]
 
 
-def main(config: RunConfig = DEFAULT_CONFIG) -> None:
+def _run_training(config: RunConfig = DEFAULT_CONFIG) -> None:
     """Fit the selected reference models and write weights plus metadata."""
     # Resolve selection before creating output directories or reading datasets.
     run_id = uuid.uuid4().hex
     selected_models = resolve_selected_models(config)
     selected_model_set = set(selected_models)
+
+    # Require an active MLflow run managed by the public entry point.
+    mlflow_run = mlflow.active_run()
+    if mlflow_run is None:
+        raise RuntimeError("Training must run inside an active MLflow run.")
+
+    # Link the internal pipeline identifier to the MLflow run.
+    mlflow.set_tags({
+        "pipeline_run_id": run_id,
+        "model_count": str(len(selected_models)),
+    })
+
+    # Record shared training settings and the selected models' configurations.
+    tracking_parameters = {
+        "run.seed": config.run.seed,
+        "run.device": config.run.device,
+        "run.selected_models": selected_models,
+        "features.count": len(config.features.names),
+        "features.names": config.features.names,
+        "training": asdict(config.training),
+    }
+    for model_name in selected_models:
+        tracking_parameters[f"models.{model_name}"] = asdict(
+            config.models[model_name]
+        )
+    mlflow.log_params(flatten_mlflow_params(tracking_parameters))
+
+    # Record the selected models and continue the existing training pipeline.
+    logger.info("MLflow run ID: %s", mlflow_run.info.run_id)
+
     logger.info("Training run started")
     logger.info("Selected models: %s", selected_models)
     provenance = collect_provenance(config, selected_models, run_id)
@@ -603,10 +699,17 @@ def main(config: RunConfig = DEFAULT_CONFIG) -> None:
         artifact_path = model_dir / f"{name}{config.output.artifact_suffixes['sklearn']}"
         joblib.dump(estimator, artifact_path)
         logger.info("Saved model artifact: %s", artifact_path.name)
+
+        # Save the model metadata.
         write_metadata(
             name, config, model_metadata, config.training.validation_metric,
             float(ap), provenance=provenance, output_dir=model_dir,
         )
+
+        # Register the model and its metadata in MLflow.
+        log_model_artifacts(name, model_dir, config)
+
+        mlflow.log_metric(f"{name}_validation_ap", ap)
         logger.info("%s validation AP=%.6f (reference AP=%.6f)", name, ap,
                     config.output.reference_validation_ap[name])
 
@@ -682,6 +785,10 @@ def main(config: RunConfig = DEFAULT_CONFIG) -> None:
             "training_batches_shuffled": mlp_config.shuffle_training_batches,
         }, config.training.validation_metric, mlp_ap, mlp_epoch,
             provenance=provenance, output_dir=model_dir)
+
+        # Register the MLP weights and metadata in MLflow.
+        log_model_artifacts("mlp", model_dir, config)
+        mlflow.log_metric("mlp_validation_ap", mlp_ap)
         logger.info("mlp validation AP=%.6f (reference AP=%.6f)", mlp_ap,
                     config.output.reference_validation_ap["mlp"])
 
@@ -770,6 +877,15 @@ def main(config: RunConfig = DEFAULT_CONFIG) -> None:
             "best_validation_reconstruction_mse": best_ae_loss,
         }, "Average Precision (AP) from per-row reconstruction MSE", ae_ap,
             best_ae_epoch, provenance=provenance, output_dir=model_dir)
+
+        # Register the Autoencoder weights and metadata in MLflow.
+        log_model_artifacts("autoencoder", model_dir, config)
+
+        # Log anomaly-ranking AP and the MSE used for checkpoint selection.
+        mlflow.log_metric("autoencoder_validation_ap", ae_ap)
+        mlflow.log_metric(
+            "autoencoder_validation_reconstruction_mse", float(best_ae_loss)
+        )
         logger.info("autoencoder validation AP=%.6f (reference AP=%.6f)", ae_ap,
                     config.output.reference_validation_ap["autoencoder"])
 
@@ -834,11 +950,26 @@ def main(config: RunConfig = DEFAULT_CONFIG) -> None:
             "input": f"{temporal_config.input_representation} features",
         }, config.training.validation_metric, ap, epoch,
             provenance=provenance, output_dir=model_dir)
+
+        # Register the current temporal model and its metadata in MLflow.
+        log_model_artifacts(name, model_dir, config)
+        mlflow.log_metric(f"{name}_validation_ap", ap)
         logger.info("%s validation AP=%.6f (reference AP=%.6f)", name, ap,
                     config.output.reference_validation_ap[name])
 
     logger.info("Training run completed successfully.")
 
+
+def main(config: RunConfig = DEFAULT_CONFIG) -> None:
+    """Run training within a managed MLflow tracking context."""
+    # Select the experiment for this training pipeline.
+    mlflow.set_experiment("Bank-Fraud-Detection")
+
+    # The context manager closes the run on success or marks it failed
+    # when an exception escapes the training pipeline.
+    with mlflow.start_run() as active_run:
+        logger.info("MLflow run started: %s", active_run.info.run_id)
+        _run_training(config)
 
 if __name__ == "__main__":
     logging.basicConfig(

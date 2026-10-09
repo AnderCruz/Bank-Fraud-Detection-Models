@@ -15,3 +15,9 @@ data/processed/
 .env
 
 .DS_Store
+
+# Local MLflow tracking database and artifacts
+mlflow.db
+mlflow.db-shm
+mlflow.db-wal
+mlruns/
